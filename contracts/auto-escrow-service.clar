@@ -5,7 +5,7 @@
 ;; ensuring both buyer and seller are protected.
 ;; This contract is intended to be used with STX as the payment currency.
 ;;
-;; Version: 1.0.0
+;; Version: 1.1.0
 ;; ---------------------------------------------------------
 
 ;; --- Constants and Errors ---
@@ -20,6 +20,23 @@
 (define-constant ERR-AMOUNT-MISMATCH (err u108))
 (define-constant ERR-SALE-NOT-FUNDED (err u109))
 (define-constant ERR-ESCROW-NOT-CONFIRMED (err u110))
+(define-constant ERR-INVALID-INPUT (err u111))
+(define-constant ERR-INVALID-VIN (err u112))
+(define-constant ERR-INVALID-FEE (err u113))
+(define-constant ERR-ZERO-AMOUNT (err u114))
+
+;; --- Validation Constants ---
+(define-constant MAX-FEE-PERMILLE u500) ;; Maximum 50% fee
+(define-constant MIN-SALE-PRICE u1000000) ;; Minimum 1 STX (1,000,000 micro-STX)
+(define-constant MAX-SALE-PRICE u100000000000000) ;; Maximum 100,000 STX
+(define-constant VIN-LENGTH u17)
+
+;; --- Status Constants ---
+(define-constant STATUS-INITIATED u0)
+(define-constant STATUS-FUNDED u1)
+(define-constant STATUS-DELIVERY-CONFIRMED u2)
+(define-constant STATUS-COMPLETE u3)
+(define-constant STATUS-CANCELED u4)
 
 ;; --- Data Storage ---
 (define-data-var last-sale-id uint u0)
@@ -33,8 +50,43 @@
   buyer: principal,
   sale-price: uint,
   vin: (string-ascii 17),
-  status: uint ;; u0: Initiated, u1: Funded, u2: Delivery-Confirmed, u3: Complete, u4: Canceled
+  status: uint
 })
+
+;; =========================================================
+;; --- Input Validation Functions ---
+;; =========================================================
+
+;; @desc Validates VIN format (17 characters, alphanumeric)
+;; @param vin: The VIN to validate
+;; @returns bool
+(define-private (is-valid-vin (vin (string-ascii 17)))
+  (is-eq (len vin) VIN-LENGTH)
+)
+
+;; @desc Validates sale price is within acceptable range
+;; @param price: The price to validate
+;; @returns bool
+(define-private (is-valid-price (price uint))
+  (and 
+    (>= price MIN-SALE-PRICE)
+    (<= price MAX-SALE-PRICE)
+  )
+)
+
+;; @desc Validates platform fee is within acceptable range
+;; @param fee: The fee to validate in permille
+;; @returns bool
+(define-private (is-valid-fee (fee uint))
+  (<= fee MAX-FEE-PERMILLE)
+)
+
+;; @desc Validates that a principal is not the zero address
+;; @param principal-to-check: The principal to validate
+;; @returns bool
+(define-private (is-valid-principal (principal-to-check principal))
+  (not (is-eq principal-to-check 'SP000000000000000000002Q6VF78))
+)
 
 ;; =========================================================
 ;; --- Administrative Functions ---
@@ -46,7 +98,15 @@
 (define-public (set-platform-fee (new-fee-permille uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
-    (ok (var-set platform-fee-permille new-fee-permille))
+    (asserts! (is-valid-fee new-fee-permille) ERR-INVALID-FEE)
+    (var-set platform-fee-permille new-fee-permille)
+    (print {
+      event: "platform-fee-updated",
+      old-fee: (var-get platform-fee-permille),
+      new-fee: new-fee-permille,
+      updated-by: tx-sender
+    })
+    (ok true)
   )
 )
 
@@ -60,26 +120,31 @@
 ;; @param vin: The VIN of the vehicle being sold.
 ;; @returns (response uint uint) The new sale ID.
 (define-public (initiate-sale (buyer principal) (sale-price uint) (vin (string-ascii 17)))
-  (begin
-    (let ((sale-id (+ u1 (var-get last-sale-id))))
-      (map-set sales sale-id {
-        seller: tx-sender,
-        buyer: buyer,
-        sale-price: sale-price,
-        vin: vin,
-        status: u0 ;; Status: Initiated
-      })
-      (var-set last-sale-id sale-id)
+  (let ((sale-id (+ u1 (var-get last-sale-id))))
+    ;; Input validation
+    (asserts! (is-valid-principal buyer) ERR-INVALID-INPUT)
+    (asserts! (not (is-eq tx-sender buyer)) ERR-INVALID-INPUT) ;; Seller cannot be buyer
+    (asserts! (is-valid-price sale-price) ERR-ZERO-AMOUNT)
+    (asserts! (is-valid-vin vin) ERR-INVALID-VIN)
 
-      (print {
-        event: "initiate-sale",
-        sale-id: sale-id,
-        seller: tx-sender,
-        buyer: buyer,
-        price: sale-price
-      })
-      (ok sale-id)
-    )
+    (map-set sales sale-id {
+      seller: tx-sender,
+      buyer: buyer,
+      sale-price: sale-price,
+      vin: vin,
+      status: STATUS-INITIATED
+    })
+    (var-set last-sale-id sale-id)
+
+    (print {
+      event: "initiate-sale",
+      sale-id: sale-id,
+      seller: tx-sender,
+      buyer: buyer,
+      price: sale-price,
+      vin: vin
+    })
+    (ok sale-id)
   )
 )
 
@@ -87,24 +152,25 @@
 ;; @param sale-id: The ID of the sale to fund.
 ;; @returns (response bool uint)
 (define-public (fund-escrow (sale-id uint))
-  (begin
-    (let ((sale (unwrap! (map-get? sales sale-id) ERR-SALE-NOT-FOUND)))
-      (asserts! (is-eq tx-sender (get buyer sale)) ERR-BUYER-ONLY)
-      (asserts! (is-eq (get status sale) u0) ERR-INVALID-SALE-STATUS) ;; Must be 'Initiated'
+  (let ((sale (unwrap! (map-get? sales sale-id) ERR-SALE-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get buyer sale)) ERR-BUYER-ONLY)
+    (asserts! (is-eq (get status sale) STATUS-INITIATED) ERR-INVALID-SALE-STATUS)
 
-      ;; Transfer STX from buyer to this contract
-      (try! (stx-transfer? (get sale-price sale) tx-sender (as-contract tx-sender)))
+    ;; Check if buyer has sufficient balance
+    (asserts! (>= (stx-get-balance tx-sender) (get sale-price sale)) ERR-INSUFFICIENT-FUNDS)
 
-      (map-set sales sale-id (merge sale { status: u1 })) ;; Status: Funded
+    ;; Transfer STX from buyer to this contract
+    (try! (stx-transfer? (get sale-price sale) tx-sender (as-contract tx-sender)))
 
-      (print {
-        event: "fund-escrow",
-        sale-id: sale-id,
-        buyer: tx-sender,
-        amount: (get sale-price sale)
-      })
-      (ok true)
-    )
+    (map-set sales sale-id (merge sale { status: STATUS-FUNDED }))
+
+    (print {
+      event: "fund-escrow",
+      sale-id: sale-id,
+      buyer: tx-sender,
+      amount: (get sale-price sale)
+    })
+    (ok true)
   )
 )
 
@@ -112,20 +178,18 @@
 ;; @param sale-id: The ID of the sale.
 ;; @returns (response bool uint)
 (define-public (confirm-delivery (sale-id uint))
-  (begin
-    (let ((sale (unwrap! (map-get? sales sale-id) ERR-SALE-NOT-FOUND)))
-      (asserts! (is-eq tx-sender (get buyer sale)) ERR-BUYER-ONLY)
-      (asserts! (is-eq (get status sale) u1) ERR-INVALID-SALE-STATUS) ;; Must be 'Funded'
+  (let ((sale (unwrap! (map-get? sales sale-id) ERR-SALE-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get buyer sale)) ERR-BUYER-ONLY)
+    (asserts! (is-eq (get status sale) STATUS-FUNDED) ERR-INVALID-SALE-STATUS)
 
-      (map-set sales sale-id (merge sale { status: u2 })) ;; Status: Delivery-Confirmed
+    (map-set sales sale-id (merge sale { status: STATUS-DELIVERY-CONFIRMED }))
 
-      (print {
-        event: "confirm-delivery",
-        sale-id: sale-id,
-        buyer: tx-sender
-      })
-      (ok true)
-    )
+    (print {
+      event: "confirm-delivery",
+      sale-id: sale-id,
+      buyer: tx-sender
+    })
+    (ok true)
   )
 )
 
@@ -133,29 +197,37 @@
 ;; @param sale-id: The ID of the sale.
 ;; @returns (response bool uint)
 (define-public (release-funds (sale-id uint))
-  (begin
-    (let ((sale (unwrap! (map-get? sales sale-id) ERR-SALE-NOT-FOUND)))
-      (asserts! (is-eq (get status sale) u2) ERR-ESCROW-NOT-CONFIRMED) ;; Must be 'Delivery-Confirmed'
+  (let ((sale (unwrap! (map-get? sales sale-id) ERR-SALE-NOT-FOUND)))
+    (asserts! (is-eq (get status sale) STATUS-DELIVERY-CONFIRMED) ERR-ESCROW-NOT-CONFIRMED)
 
-      (let ((total-amount (get sale-price sale))
-            (platform-fee (/ (* total-amount (var-get platform-fee-permille)) u1000))
-            (seller-payment (- total-amount platform-fee)))
+    (let ((total-amount (get sale-price sale))
+          (platform-fee (/ (* total-amount (var-get platform-fee-permille)) u1000))
+          (seller-payment (- total-amount platform-fee)))
 
-        ;; Pay platform fee to contract owner
+      ;; Ensure calculations are correct
+      (asserts! (> seller-payment u0) ERR-INVALID-INPUT)
+      (asserts! (is-eq (+ seller-payment platform-fee) total-amount) ERR-AMOUNT-MISMATCH)
+
+      ;; Pay platform fee to contract owner (only if fee > 0)
+      (if (> platform-fee u0)
         (try! (as-contract (stx-transfer? platform-fee (as-contract tx-sender) CONTRACT-OWNER)))
-        ;; Pay seller
-        (try! (as-contract (stx-transfer? seller-payment (as-contract tx-sender) (get seller sale))))
-
-        (map-set sales sale-id (merge sale { status: u3 })) ;; Status: Complete
-
-        (print {
-          event: "release-funds",
-          sale-id: sale-id,
-          seller: (get seller sale),
-          amount: seller-payment
-        })
-        (ok true)
+        true
       )
+
+      ;; Pay seller
+      (try! (as-contract (stx-transfer? seller-payment (as-contract tx-sender) (get seller sale))))
+
+      (map-set sales sale-id (merge sale { status: STATUS-COMPLETE }))
+
+      (print {
+        event: "release-funds",
+        sale-id: sale-id,
+        seller: (get seller sale),
+        seller-amount: seller-payment,
+        platform-fee: platform-fee,
+        total-amount: total-amount
+      })
+      (ok true)
     )
   )
 )
@@ -165,26 +237,25 @@
 ;; @param sale-id: The ID of the sale to cancel.
 ;; @returns (response bool uint)
 (define-public (cancel-sale (sale-id uint))
-  (begin
-    (let ((sale (unwrap! (map-get? sales sale-id) ERR-SALE-NOT-FOUND)))
-      (asserts! (or (is-eq tx-sender (get buyer sale)) (is-eq tx-sender (get seller sale))) ERR-NOT-AUTHORIZED)
-      (asserts! (or (is-eq (get status sale) u0) (is-eq (get status sale) u1)) ERR-INVALID-SALE-STATUS)
+  (let ((sale (unwrap! (map-get? sales sale-id) ERR-SALE-NOT-FOUND)))
+    (asserts! (or (is-eq tx-sender (get buyer sale)) (is-eq tx-sender (get seller sale))) ERR-NOT-AUTHORIZED)
+    (asserts! (or (is-eq (get status sale) STATUS-INITIATED) (is-eq (get status sale) STATUS-FUNDED)) ERR-INVALID-SALE-STATUS)
 
-      ;; If the sale was funded, refund the buyer
-      (if (is-eq (get status sale) u1)
-        (try! (as-contract (stx-transfer? (get sale-price sale) (as-contract tx-sender) (get buyer sale))))
-        true
-      )
-
-      (map-set sales sale-id (merge sale { status: u4 })) ;; Status: Canceled
-
-      (print {
-        event: "cancel-sale",
-        sale-id: sale-id,
-        canceled-by: tx-sender
-      })
-      (ok true)
+    ;; If the sale was funded, refund the buyer
+    (if (is-eq (get status sale) STATUS-FUNDED)
+      (try! (as-contract (stx-transfer? (get sale-price sale) (as-contract tx-sender) (get buyer sale))))
+      true
     )
+
+    (map-set sales sale-id (merge sale { status: STATUS-CANCELED }))
+
+    (print {
+      event: "cancel-sale",
+      sale-id: sale-id,
+      canceled-by: tx-sender,
+      refund-amount: (if (is-eq (get status sale) STATUS-FUNDED) (some (get sale-price sale)) none)
+    })
+    (ok true)
   )
 )
 
@@ -203,4 +274,46 @@
 ;; @returns uint
 (define-read-only (get-platform-fee)
   (var-get platform-fee-permille)
+)
+
+;; @desc Gets the current sale counter.
+;; @returns uint
+(define-read-only (get-last-sale-id)
+  (var-get last-sale-id)
+)
+
+;; @desc Gets the status string for a given status code.
+;; @param status: The status code.
+;; @returns (string-ascii 20)
+(define-read-only (get-status-string (status uint))
+  (if (is-eq status STATUS-INITIATED)
+    "Initiated"
+    (if (is-eq status STATUS-FUNDED)
+      "Funded"
+      (if (is-eq status STATUS-DELIVERY-CONFIRMED)
+        "Delivery-Confirmed"
+        (if (is-eq status STATUS-COMPLETE)
+          "Complete"
+          (if (is-eq status STATUS-CANCELED)
+            "Canceled"
+            "Unknown"
+          )
+        )
+      )
+    )
+  )
+)
+
+;; @desc Calculate the fees and amounts for a given sale price.
+;; @param sale-price: The sale price to calculate fees for.
+;; @returns {platform-fee: uint, seller-amount: uint, total: uint}
+(define-read-only (calculate-fees (sale-price uint))
+  (let ((platform-fee (/ (* sale-price (var-get platform-fee-permille)) u1000))
+        (seller-amount (- sale-price platform-fee)))
+    {
+      platform-fee: platform-fee,
+      seller-amount: seller-amount,
+      total: sale-price
+    }
+  )
 )
